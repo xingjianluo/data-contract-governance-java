@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+# local spring-boot run log
+app-run.log
