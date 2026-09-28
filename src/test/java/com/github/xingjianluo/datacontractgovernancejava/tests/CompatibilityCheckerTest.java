@@ -47,19 +47,29 @@ class CompatibilityCheckerTest {
     }
 
     @Test
-    void backwardRejectsFieldRemoval() {
+    void backwardAllowsFieldRemoval() {
+        // BACKWARD=新读者读旧数据：旧数据仍带被删字段，新读者忽略多余字段，删除不破坏 BACKWARD 方向
         DataContract v1 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true), f("note", "string", false));
         DataContract v2 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
-        CompatibilityReport report = checkAndLog("BACKWARD删除字段", v1, v2);
-        assertFalse(report.compatible());
-        assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
+        assertTrue(checkAndLog("BACKWARD删除可选字段", v1, v2).compatible());
+
+        DataContract v3 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true), f("code", "string", true));
+        DataContract v4 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
+        assertTrue(checkAndLog("BACKWARD删除必填字段", v3, v4).compatible());
     }
 
     @Test
-    void forwardAllowsFieldRemoval() {
+    void forwardAllowsOptionalFieldRemovalButRejectsRequiredRemoval() {
+        // FORWARD=旧读者读新数据：被删字段可选时旧读者已容忍缺失；必填时新数据缺失会让旧读者失败
         DataContract v1 = contract(CompatibilityLevel.FORWARD, f("id", "long", true), f("note", "string", false));
         DataContract v2 = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
-        assertTrue(checkAndLog("FORWARD删除字段", v1, v2).compatible());
+        assertTrue(checkAndLog("FORWARD删除可选字段", v1, v2).compatible());
+
+        DataContract v3 = contract(CompatibilityLevel.FORWARD, f("id", "long", true), f("code", "string", true));
+        DataContract v4 = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
+        CompatibilityReport requiredRemoved = checkAndLog("FORWARD删除必填字段", v3, v4);
+        assertFalse(requiredRemoved.compatible());
+        assertTrue(requiredRemoved.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
     }
 
     @Test
@@ -116,12 +126,32 @@ class CompatibilityCheckerTest {
     }
 
     @Test
-    void fullLevelRejectsBothRemovalAndRequiredAddition() {
-        DataContract v1 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("note", "string", false));
+    void fullLevelRejectsRequiredRemovalAndRequiredAddition() {
+        // FULL 两个方向都校验：删除必填字段破坏 FORWARD，新增必填字段破坏 BACKWARD
+        DataContract v1 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("note", "string", true));
         DataContract v2 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("code", "string", true));
-        CompatibilityReport report = checkAndLog("FULL删除+新增必填", v1, v2);
+        CompatibilityReport report = checkAndLog("FULL删除必填+新增必填", v1, v2);
         assertFalse(report.compatible());
         assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
         assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_ADDED));
+    }
+
+    @Test
+    void requiredRelaxationRejectedUnderForwardAndFullButAllowedUnderBackward() {
+        // 必填->可选：新数据可能缺字段，旧读者仍按必填读 -> FORWARD/FULL 拒绝；
+        // 新读者对旧数据（字段必在）只会更宽松 -> BACKWARD 合法
+        DataContract prev = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
+        DataContract nextB = contract(CompatibilityLevel.BACKWARD, f("id", "long", false));
+        assertTrue(checkAndLog("BACKWARD必填放宽", prev, nextB).compatible());
+
+        DataContract nextF = contract(CompatibilityLevel.FORWARD, f("id", "long", false));
+        CompatibilityReport forward = checkAndLog("FORWARD必填放宽", prev, nextF);
+        assertFalse(forward.compatible());
+        assertTrue(forward.violations().stream().anyMatch(v -> v.changeType() == ChangeType.REQUIRED_RELAXED));
+
+        DataContract nextFull = contract(CompatibilityLevel.FULL, f("id", "long", false));
+        CompatibilityReport full = checkAndLog("FULL必填放宽", prev, nextFull);
+        assertFalse(full.compatible());
+        assertTrue(full.violations().stream().anyMatch(v -> v.changeType() == ChangeType.REQUIRED_RELAXED));
     }
 }
