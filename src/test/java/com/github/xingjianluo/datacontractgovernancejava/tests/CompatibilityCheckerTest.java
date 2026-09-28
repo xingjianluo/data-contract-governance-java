@@ -116,6 +116,49 @@ class CompatibilityCheckerTest {
     }
 
     @Test
+    void requiredRelaxationDirectionFollowsCompatibilityLevel() {
+        // 必填 -> 可选：
+        // BACKWARD 允许（新读者能容忍旧数据里该字段一直存在）
+        DataContract backOld = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
+        DataContract backNew = contract(CompatibilityLevel.BACKWARD, f("id", "long", false));
+        assertTrue(checkAndLog("BACKWARD必填放宽", backOld, backNew).compatible(),
+                "BACKWARD 下必填->可选是合法演进，不得误伤");
+
+        // FORWARD 拒绝（旧读者按必填消费，新数据该字段可能缺失）
+        DataContract fwdOld = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
+        DataContract fwdNew = contract(CompatibilityLevel.FORWARD, f("id", "long", false));
+        CompatibilityReport fwdReport = checkAndLog("FORWARD必填放宽", fwdOld, fwdNew);
+        assertFalse(fwdReport.compatible(), "FORWARD 下必填->可选破坏旧读者，必须拦住");
+        assertTrue(fwdReport.violations().stream()
+                .anyMatch(v -> v.changeType() == ChangeType.REQUIRED_RELAXED));
+
+        // FULL 双向约束，同样拒绝
+        DataContract fullOld = contract(CompatibilityLevel.FULL, f("id", "long", true));
+        DataContract fullNew = contract(CompatibilityLevel.FULL, f("id", "long", false));
+        CompatibilityReport fullReport = checkAndLog("FULL必填放宽", fullOld, fullNew);
+        assertFalse(fullReport.compatible(), "FULL 下必填->可选必须拦住");
+        assertTrue(fullReport.violations().stream()
+                .anyMatch(v -> v.changeType() == ChangeType.REQUIRED_RELAXED));
+    }
+
+    @Test
+    void requiredTighteningDirectionFollowsCompatibilityLevel() {
+        // 可选 -> 必填：FORWARD 允许（旧数据始终带该字段时旧读者不受影响，新数据只会更严格）
+        DataContract fwdOld = contract(CompatibilityLevel.FORWARD, f("id", "long", false));
+        DataContract fwdNew = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
+        assertTrue(checkAndLog("FORWARD必填收紧", fwdOld, fwdNew).compatible(),
+                "FORWARD 下可选->必填是合法演进，不得误伤");
+
+        // FULL 拒绝（与 BACKWARD 同向的破坏性变化必须拦住）
+        DataContract fullOld = contract(CompatibilityLevel.FULL, f("id", "long", false));
+        DataContract fullNew = contract(CompatibilityLevel.FULL, f("id", "long", true));
+        CompatibilityReport fullReport = checkAndLog("FULL必填收紧", fullOld, fullNew);
+        assertFalse(fullReport.compatible(), "FULL 下可选->必填必须拦住");
+        assertTrue(fullReport.violations().stream()
+                .anyMatch(v -> v.changeType() == ChangeType.REQUIRED_TIGHTENED));
+    }
+
+    @Test
     void fullLevelRejectsBothRemovalAndRequiredAddition() {
         DataContract v1 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("note", "string", false));
         DataContract v2 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("code", "string", true));

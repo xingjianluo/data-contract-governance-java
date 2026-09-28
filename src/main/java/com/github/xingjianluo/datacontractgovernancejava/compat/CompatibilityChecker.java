@@ -16,12 +16,18 @@ import java.util.stream.Collectors;
 /**
  * 按契约声明的兼容级别，对新旧两版契约做结构演进判定。
  *
+ * 方向语义：
+ * - BACKWARD：新契约（新读者）必须能读取旧版本数据；
+ * - FORWARD：旧契约（旧读者）必须能读取新版本数据；
+ * - FULL：双向都必须成立；NONE 不做约束。
+ *
  * 规则（NONE 一律放行）：
  * - 删除字段：BACKWARD/FULL 拒绝（新读者读旧数据时字段缺失），FORWARD 允许；
  * - 新增必填字段：BACKWARD/FULL 拒绝（旧数据无该字段），FORWARD 允许；
  * - 新增可选字段：各级别均允许；
  * - 类型变更：BACKWARD/FORWARD/FULL 均拒绝；
- * - 必填收紧（可选->必填）：BACKWARD/FULL 拒绝；放宽（必填->可选）各级别允许；
+ * - 必填收紧（可选->必填）：BACKWARD/FULL 拒绝（旧数据中该字段可能缺失），FORWARD 允许；
+ * - 必填放宽（必填->可选）：FORWARD/FULL 拒绝（旧读者按必填消费新数据，字段可能缺失/为空），BACKWARD 允许；
  * - 重命名：视为删除+新增，按上述规则判定，违规依据中标注 FIELD_RENAMED。
  */
 @Component
@@ -73,24 +79,27 @@ public class CompatibilityChecker {
         }
 
         // 4) 删除字段（含重命名的旧名）判定
-        boolean forbidRemoval = level == CompatibilityLevel.BACKWARD || level == CompatibilityLevel.FULL;
-        if (forbidRemoval) {
+        // BACKWARD/FULL：新读者必须能读旧数据，删除字段会使旧数据中的该字段在新契约里无处安放 -> 拒绝
+        boolean backwardSafe = level == CompatibilityLevel.BACKWARD || level == CompatibilityLevel.FULL;
+        if (backwardSafe) {
             for (String name : removed) {
                 violations.add(new CompatibilityViolation(ChangeType.FIELD_REMOVED, name,
                         "级别 " + level + " 不允许删除字段（新读者需能读取旧数据）"));
             }
         }
 
-        // 5) 新增字段判定：必填新增在 BACKWARD/FULL 下拒绝
+        // 5) 新增字段判定：必填新增在 BACKWARD/FULL 下拒绝（旧数据中不存在该字段）
         for (String name : added) {
             ContractField field = newFields.get(name);
-            if (field.isRequired() && forbidRemoval) {
+            if (field.isRequired() && backwardSafe) {
                 violations.add(new CompatibilityViolation(ChangeType.FIELD_ADDED, name,
                         "级别 " + level + " 不允许新增必填字段（旧数据中不存在该字段）"));
             }
         }
 
         // 6) 共有字段：类型变更与必填性调整
+        // FORWARD/FULL：旧读者必须能读新数据
+        boolean forwardSafe = level == CompatibilityLevel.FORWARD || level == CompatibilityLevel.FULL;
         for (String name : oldFields.keySet()) {
             ContractField oldField = oldFields.get(name);
             ContractField newField = newFields.get(name);
@@ -103,12 +112,20 @@ public class CompatibilityChecker {
                                 + "，级别 " + level + " 不允许"));
             }
             if (!oldField.isRequired() && newField.isRequired()) {
-                if (forbidRemoval) {
+                // 可选->必填：旧数据中该字段可能缺失，BACKWARD/FULL 下新读者无法保证读到
+                if (backwardSafe) {
                     violations.add(new CompatibilityViolation(ChangeType.REQUIRED_TIGHTENED, name,
-                            "必填性由可选收紧为必填，级别 " + level + " 不允许"));
+                            "必填性由可选收紧为必填（旧数据中该字段可能缺失），级别 " + level + " 不允许"));
                 }
             }
-            // 必填->可选（REQUIRED_RELAXED）在所有级别下均视为安全，不产生违规
+            if (oldField.isRequired() && !newField.isRequired()) {
+                // 必填->可选：新数据中该字段可能缺失，FORWARD/FULL 下旧读者按必填消费会失败
+                if (forwardSafe) {
+                    violations.add(new CompatibilityViolation(ChangeType.REQUIRED_RELAXED, name,
+                            "必填性由必填放宽为可选（旧读者按必填消费，新数据该字段可能缺失），级别 "
+                                    + level + " 不允许"));
+                }
+            }
         }
 
         // 重命名仅作为提示性依据：若其删除/新增本身未违规（如 FORWARD 下），不应导致拒绝

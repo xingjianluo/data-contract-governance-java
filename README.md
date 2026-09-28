@@ -1,39 +1,62 @@
 # 数据契约与元数据治理
 
-基于 Spring Boot 的本地存储实现，提供数据契约多版本注册、兼容性判定、字段级血缘登记与敏感级别传播能力。所有入口（REST API 与内部调用）共享同一套注册中心，保证结构演进、并发注册与敏感数据传播得到一致且可解释的结论。
+基于 Spring Boot 的本地存储实现，提供数据契约多版本注册、**演进预检（先看结论再决定落库）**、兼容性判定、字段级血缘登记与敏感级别传播能力。所有入口（REST API 与内部调用）共享同一套注册中心与同一份判定函数，保证预检与正式注册结论完全一致、结构演进与并发重放得到一致且可解释的结论。
 
 ## 模块结构
 
 ```
 model/     契约、字段、兼容级别、敏感级别等领域类型
 compat/    兼容性判定（CompatibilityChecker），输出可区分的违规依据
-registry/  契约注册中心（ContractRegistry），本地多版本存储
+registry/  契约注册中心（ContractRegistry）、演进预检（PrecheckResult）、本地多版本存储
 lineage/   血缘登记与敏感传播（LineageRegistry）
 error/     统一异常 GovernanceException + 可区分拒绝原因 RejectReason
 api/       REST 入口与统一异常映射（拒绝原因 -> HTTP 409）
 ```
 
-## 兼容性规则
+## 兼容级别的方向语义
 
-按契约声明的 `compatibility` 级别判定（`NONE` 一律放行）：
+判定严格按兼容级别声明的**读方向**执行：
+
+- **BACKWARD（向后兼容）**：新版本契约（新读者）必须能读取**旧版本数据**。旧数据里有的字段不能删、不能缺，旧数据没有的必填字段不能加。
+- **FORWARD（向前兼容）**：旧版本契约（旧读者）必须能读取**新版本数据**。新数据中可能缺失/为空的字段，不能让仍按旧契约消费的读者失败。
+- **FULL**：双向都必须成立，即同时满足 BACKWARD 与 FORWARD。
+- **NONE**：不做任何兼容性约束。
 
 | 变更 | BACKWARD | FORWARD | FULL |
 |---|---|---|---|
-| 删除字段 | 拒绝 | 允许 | 拒绝 |
-| 新增必填字段 | 拒绝 | 允许 | 拒绝 |
+| 删除字段 | 拒绝（新读者读旧数据缺字段） | 允许 | 拒绝 |
+| 新增必填字段 | 拒绝（旧数据无此字段） | 允许 | 拒绝 |
 | 新增可选字段 | 允许 | 允许 | 允许 |
 | 类型变更 | 拒绝 | 拒绝 | 拒绝 |
-| 必填收紧（可选→必填） | 拒绝 | 允许 | 拒绝 |
-| 必填放宽（必填→可选） | 允许 | 允许 | 允许 |
-| 重命名 | 视为删除+新增，按上述规则判定，结论中附 `FIELD_RENAMED` 提示依据 |
+| 必填收紧（可选→必填） | 拒绝（旧数据可能缺该字段） | 允许 | 拒绝 |
+| 必填放宽（必填→可选） | 允许 | **拒绝（旧读者按必填读新数据，字段可能缺失/为空）** | **拒绝** |
+| 重命名 | 视为删除+新增，按上述规则判定，结论中附 `FIELD_RENAMED` 提示依据 | 同左 | 同左 |
 
-判定结论为 `CompatibilityReport(compatible, violations)`，每条违规携带 `ChangeType`（FIELD_ADDED / FIELD_REMOVED / TYPE_CHANGED / REQUIRED_TIGHTENED / FIELD_RENAMED 等）、字段名与可读描述，拒绝原因彼此可区分。
+判定结论为 `CompatibilityReport(compatible, violations)`，每条违规携带 `ChangeType`（FIELD_ADDED / FIELD_REMOVED / TYPE_CHANGED / REQUIRED_TIGHTENED / REQUIRED_RELAXED / FIELD_RENAMED）、字段名与可读描述，拒绝原因彼此可区分。切换兼容级别后，同一结构变化的结论严格跟随该级别的真实读写方向：该拦的破坏性变更一定拦住，合法演进不误伤。
 
-## 注册语义（幂等与并发）
+## 演进预检（先看结论，再决定落库）
 
-- **幂等**：重复提交与最新版本内容指纹（名称+级别+字段集合）完全一致的契约，返回 `IDEMPOTENT` 状态与现有版本号，不产生新版本。
-- **并发**：按契约名加锁串行化，临界区内完成 校验 → 兼容判定 → 提交。同一契约并发注册不会出现版本号重复或丢失更新，版本号为 1..N 连续序列。
-- **失败无残留**：被拒绝（`INCOMPATIBLE_SCHEMA` / `INVALID_CONTRACT`）或失败的请求在提交前抛出，不留下任何部分写入状态；重复调用结论可复现。
+正式发布前，可拿候选契约做**只读预检**：指定要参照的已有版本和兼容级别（兼容级别以候选契约体内的 `compatibility` 为准），系统回答“现在注册会不会被拒、依据是什么”。
+
+- 预检与正式注册共享同一个判定函数 `decideLocked`，**结论逐条一致**（同一变化不会在预检和正式注册给出两套结果）；
+- 预检**绝不写入**任何已注册数据，历史版本数与内容在预检前后不变；
+- 预检结论 `PrecheckResult`：
+  - `COMPATIBLE`：可以注册，`resolvedVersion` 为将要分配的新版本号；
+  - `IDEMPOTENT_REPLAY`：内容已存在，`resolvedVersion` 为命中的历史版本号；
+  - `REJECTED`：`violations` 给出全部依据，并通过 `violationsByType` 按 `ChangeType` 分组。
+
+```
+POST /api/contracts/precheck?baseVersion=2
+```
+
+`baseVersion` 可省略（默认以最新版本为参照）。预检 HTTP 状态始终为 200（结论体表达通过/拒绝）；非法契约或参照版本不存在返回 409（`INVALID_CONTRACT` / `VERSION_CONFLICT`）。
+
+## 注册语义（历史版本重放收敛与并发）
+
+- **历史版本重放收敛（幂等范围）**：候选内容指纹（名称+级别+字段集合）与**任一已注册历史版本**完全一致时，无论当前最新版本是谁，一律返回 `IDEMPOTENT_REPLAY` 与那个**已有版本号**，不额外生成新版本。CI 重跑、发布系统补投旧版本内容都安全。只有内容与**全部历史版本**都不同时才按新版本处理，并仍需通过兼容判定。
+- **收敛优先**：重放判定先于兼容判定——补投旧版本即使与最新版本之间存在破坏性差异，也直接按幂等收敛，不会被误拒。
+- **并发**：按契约名加锁串行化，`校验 → 历史重放收敛 → 参照版本解析 → 兼容判定 → 提交` 在同一临界区内完成。并发注册/并发重放不会出现版本号重复、丢失更新或半写入状态，版本号为 1..N 连续序列。
+- **失败无残留**：被拒绝（`INCOMPATIBLE_SCHEMA` / `INVALID_CONTRACT` / `VERSION_CONFLICT`）的请求在提交前抛出，不留下任何部分写入状态；重复调用结论可复现。
 
 ## 血缘与敏感传播规则
 
@@ -47,14 +70,15 @@ api/       REST 入口与统一异常映射（拒绝原因 -> HTTP 409）
 ## REST 入口
 
 ```
-POST /api/contracts                     注册契约新版本（拒绝时返回 409 + reason）
-GET  /api/contracts/{name}/versions     查询版本历史
-POST /api/lineage                       登记血缘边 {"from":{"contract":"a","field":"x"},"to":{...}}
-GET  /api/lineage                       查询全部血缘边
+POST /api/contracts/precheck?baseVersion={n}  演进预检（只读，200 返回 COMPATIBLE/IDEMPOTENT_REPLAY/REJECTED）
+POST /api/contracts?baseVersion={n}           正式注册新版本（baseVersion 可省，默认最新；拒绝时返回 409 + reason + violationsByType）
+GET  /api/contracts/{name}/versions           查询版本历史
+POST /api/lineage                             登记血缘边 {"from":{"contract":"a","field":"x"},"to":{...}}
+GET  /api/lineage                             查询全部血缘边
 GET  /api/lineage/sensitivity/{contract}/{field}  查询字段有效敏感级别与冲突依据
 ```
 
-注册请求示例：
+注册/预检请求示例：
 
 ```json
 {
@@ -67,11 +91,47 @@ GET  /api/lineage/sensitivity/{contract}/{field}  查询字段有效敏感级别
 }
 ```
 
+预检被拒绝时的结论示例：
+
+```json
+{
+  "status": "REJECTED",
+  "contractName": "orders",
+  "baseVersion": 1,
+  "resolvedVersion": null,
+  "violations": [
+    {"changeType": "FIELD_ADDED", "field": "code", "detail": "级别 BACKWARD 不允许新增必填字段（旧数据中不存在该字段）"}
+  ],
+  "violationsByType": {
+    "FIELD_ADDED": [ {"changeType": "FIELD_ADDED", "field": "code", "detail": "..."} ]
+  }
+}
+```
+
 ## 本地验证
 
 ```bash
-mvn test          # 运行全部测试（兼容性、血缘、并发、幂等，共 19 例）
-mvn spring-boot:run   # 本地启动，默认 8080 端口
+mvn test               # 运行全部测试（兼容性、演进预检、历史重放、血缘、并发幂等，共 28 例）
+mvn spring-boot:run    # 本地启动，默认 8080 端口
 ```
 
-测试覆盖：不兼容变更（删字段/类型变更/必填收紧/重命名，按级别区分结论）、环状血缘、悬空引用、重复登记幂等、敏感级别传递传播与多上游冲突收敛、16 线程并发注册（版本号唯一连续、不丢失更新）、相同内容并发提交幂等收敛。单测日志打印输入与判定依据，结论可区分且可复现。
+手工验证预检与重放：
+
+```bash
+# 注册 v1
+curl -s -XPOST localhost:8080/api/contracts -H 'Content-Type: application/json' -d \
+  '{"name":"orders","compatibility":"BACKWARD","fields":[{"name":"id","type":"long","required":true}]}'
+# 预检一个破坏性候选（新增必填），观察 REJECTED 且 GET versions 仍是 1 个版本
+curl -s -XPOST localhost:8080/api/contracts/precheck -H 'Content-Type: application/json' -d \
+  '{"name":"orders","compatibility":"BACKWARD","fields":[{"name":"id","type":"long","required":true},{"name":"code","type":"string","required":true}]}'
+```
+
+测试覆盖：
+
+- 兼容性方向语义：删字段/类型变更/必填收紧与放宽在 BACKWARD/FORWARD/FULL 各级别下的判定；
+- **演进预检与正式注册结论逐条一致**（含拒绝依据按变更种类分组）、预检只读不落库、显式参照版本；
+- **历史版本重放收敛**：补投旧版本返回原版本号且不新增，全新内容才升版并仍过兼容判定；
+- 12 线程并发重放 v1/v2 只收敛到已有版本；16 线程并发注册版本号唯一连续；
+- 环状血缘、悬空引用、重复登记幂等、敏感级别传递传播与多上游冲突收敛。
+
+单测与注册中心日志均打印输入（契约名/级别/参照版本/指纹）与判定依据，结论可区分且可复现。
