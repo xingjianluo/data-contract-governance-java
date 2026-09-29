@@ -47,19 +47,77 @@ class CompatibilityCheckerTest {
     }
 
     @Test
-    void backwardRejectsFieldRemoval() {
-        DataContract v1 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true), f("note", "string", false));
-        DataContract v2 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
-        CompatibilityReport report = checkAndLog("BACKWARD删除字段", v1, v2);
-        assertFalse(report.compatible());
-        assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
+    void backwardAllowsFieldRemovalEvenWhenRequired() {
+        // BACKWARD：新读者读旧数据。旧数据仍携带被删字段，新读者忽略多余字段即可，
+        // 无论被删字段原本必填还是可选都不会读丢，合法放行，不得误伤。
+        DataContract v1 = contract(CompatibilityLevel.BACKWARD,
+                f("id", "long", true), f("note", "string", false));
+
+        // 删除可选字段
+        DataContract dropOptional = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
+        assertTrue(checkAndLog("BACKWARD删除可选字段", v1, dropOptional).compatible(),
+                "BACKWARD 下删除可选字段是合法演进，不得误伤");
+
+        // 删除必填字段
+        DataContract dropRequired = contract(CompatibilityLevel.BACKWARD, f("note", "string", false));
+        assertTrue(checkAndLog("BACKWARD删除必填字段", v1, dropRequired).compatible(),
+                "BACKWARD 下删除必填字段同样合法（旧数据仍带该字段，新读者忽略即可）");
     }
 
     @Test
-    void forwardAllowsFieldRemoval() {
-        DataContract v1 = contract(CompatibilityLevel.FORWARD, f("id", "long", true), f("note", "string", false));
-        DataContract v2 = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
-        assertTrue(checkAndLog("FORWARD删除字段", v1, v2).compatible());
+    void forwardRejectsRemovingRequiredFieldButAllowsOptional() {
+        // FORWARD：旧读者必须能读新数据。
+        DataContract v1 = contract(CompatibilityLevel.FORWARD,
+                f("id", "long", true), f("note", "string", false));
+
+        // 删掉可选字段：旧读者本就容忍其缺失，放行
+        DataContract dropOptional = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
+        assertTrue(checkAndLog("FORWARD删除可选字段", v1, dropOptional).compatible(),
+                "FORWARD 下删除可选字段合法，不得误伤");
+
+        // 删掉必填字段：旧读者按必填消费，新数据不再提供 -> 读丢，必须拦住
+        DataContract dropRequired = contract(CompatibilityLevel.FORWARD, f("note", "string", false));
+        CompatibilityReport report = checkAndLog("FORWARD删除必填字段", v1, dropRequired);
+        assertFalse(report.compatible(), "FORWARD 下删除必填字段是破坏性变更，必须拦住");
+        assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED),
+                "拒绝依据必须按变更种类标注为 FIELD_REMOVED");
+    }
+
+    @Test
+    void fieldRemovalMatrixAcrossLevelsAndRequiredness() {
+        // 删除字段结论矩阵（行=兼容级别，列=被删字段原本的必填性）：
+        //                 删除必填   删除可选
+        //  BACKWARD         允许       允许
+        //  FORWARD          拒绝       允许
+        //  FULL             拒绝       允许
+        for (CompatibilityLevel level : List.of(CompatibilityLevel.BACKWARD,
+                CompatibilityLevel.FORWARD, CompatibilityLevel.FULL)) {
+            DataContract prev = contract(level,
+                    f("id", "long", true), f("note", "string", false));
+
+            CompatibilityReport dropRequired = checkAndLog(level + "-删除必填",
+                    prev, contract(level, f("note", "string", false)));
+            boolean requiredShouldReject = level != CompatibilityLevel.BACKWARD;
+            assertEqualsCompat(requiredShouldReject, dropRequired.compatible(), level, "删除必填字段");
+            if (requiredShouldReject) {
+                assertTrue(dropRequired.violations().stream()
+                        .anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
+            }
+
+            CompatibilityReport dropOptional = checkAndLog(level + "-删除可选",
+                    prev, contract(level, f("id", "long", true)));
+            assertTrue(dropOptional.compatible(),
+                    level + " 下删除可选字段双向都可容忍，必须放行，不得误伤");
+        }
+    }
+
+    private static void assertEqualsCompat(boolean expectedRejected, boolean actualCompatible,
+                                           CompatibilityLevel level, String change) {
+        if (expectedRejected) {
+            assertFalse(actualCompatible, level + " 下" + change + "必须拦住");
+        } else {
+            assertTrue(actualCompatible, level + " 下" + change + "必须放行");
+        }
     }
 
     @Test
@@ -159,12 +217,26 @@ class CompatibilityCheckerTest {
     }
 
     @Test
-    void fullLevelRejectsBothRemovalAndRequiredAddition() {
-        DataContract v1 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("note", "string", false));
-        DataContract v2 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("code", "string", true));
-        CompatibilityReport report = checkAndLog("FULL删除+新增必填", v1, v2);
+    void fullLevelRejectsRemovingRequiredFieldAndRequiredAddition() {
+        // FULL 双向约束：删除必填字段在 FORWARD 一侧读丢 -> 拒；新增必填字段在 BACKWARD 一侧读丢 -> 拒。
+        DataContract v1 = contract(CompatibilityLevel.FULL,
+                f("id", "long", true), f("note", "string", true));
+        DataContract v2 = contract(CompatibilityLevel.FULL,
+                f("id", "long", true), f("code", "string", true));
+        CompatibilityReport report = checkAndLog("FULL删除必填+新增必填", v1, v2);
         assertFalse(report.compatible());
         assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
         assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_ADDED));
+    }
+
+    @Test
+    void fullLevelAllowsRemovingOptionalField() {
+        // FULL 下删除可选字段：BACKWARD 一侧旧数据仍带该字段（新读者忽略），
+        // FORWARD 一侧旧读者本就容忍可选字段缺失，双向都能容忍，必须放行。
+        DataContract v1 = contract(CompatibilityLevel.FULL,
+                f("id", "long", true), f("note", "string", false));
+        DataContract v2 = contract(CompatibilityLevel.FULL, f("id", "long", true));
+        assertTrue(checkAndLog("FULL删除可选字段", v1, v2).compatible(),
+                "FULL 不得把单向限制套到整个级别：双向都能容忍的删除不应被拒");
     }
 }

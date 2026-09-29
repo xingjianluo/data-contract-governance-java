@@ -211,6 +211,110 @@ class EvolutionManagementTest {
         assertEquals(2, registry.versions("evt").size(), "并发重放不得产生重复版本");
     }
 
+    @Test
+    void fieldRemovalPrecheckParityAcrossLevels() {
+        // 同一份“删除字段”候选在预检与正式注册中结论必须一致，且严格跟随级别的读写方向：
+        //                 删除必填          删除可选
+        //  BACKWARD         通过/落库         通过/落库
+        //  FORWARD          拒绝 FIELD_REMOVED 通过/落库
+        //  FULL             拒绝 FIELD_REMOVED 通过/落库
+        for (CompatibilityLevel level : List.of(CompatibilityLevel.BACKWARD,
+                CompatibilityLevel.FORWARD, CompatibilityLevel.FULL)) {
+            String base = "rm-" + level;
+
+            // 删除必填字段：基线 {id 必填, note 可选} -> 候选 {note 可选}
+            DataContract dropRequired = contract(base + "-req", level, f("note", "string", false));
+            assertRemovalParity(level, base + "-req",
+                    contract(base + "-req", level, f("id", "long", true), f("note", "string", false)),
+                    dropRequired, true);
+
+            // 删除可选字段：基线 {id 必填, note 可选} -> 候选 {id 必填}
+            DataContract dropOptional = contract(base + "-opt", level, f("id", "long", true));
+            assertRemovalParity(level, base + "-opt",
+                    contract(base + "-opt", level, f("id", "long", true), f("note", "string", false)),
+                    dropOptional, false);
+        }
+    }
+
+    @Test
+    void sameFieldRemovalCandidateFollowsSwitchedCompatibilityLevel() {
+        // 同一份“删除必填字段”候选，切换级别后结论必须跟随该级别真实读写含义：
+        String name = "rm-switch";
+        DataContract v1 = contract(name, CompatibilityLevel.FORWARD,
+                f("id", "long", true), f("note", "string", false));
+        registry.register(v1);
+
+        // 以 FORWARD 注册的基线，候选切到 BACKWARD 做删除必填：新读者读旧数据，合法 -> 预检通过并可落库
+        DataContract asBackward = contract(name, CompatibilityLevel.BACKWARD, f("note", "string", false));
+        PrecheckResult backwardPre = registry.precheck(asBackward, null);
+        log.info("[切换级别-BACKWARD删除必填] 预检={}, 依据={}",
+                backwardPre.status(), backwardPre.violations());
+        assertEquals(PrecheckStatus.COMPATIBLE, backwardPre.status());
+        RegistrationResult registered = registry.register(asBackward);
+        assertEquals(RegistrationStatus.REGISTERED, registered.status());
+
+        // 再补一个 FORWARD 基线，同形态候选在 FORWARD 下必须拒绝
+        String forwardName = "rm-switch-fwd";
+        registry.register(contract(forwardName, CompatibilityLevel.FORWARD,
+                f("id", "long", true), f("note", "string", false)));
+        DataContract asForward = contract(forwardName, CompatibilityLevel.FORWARD,
+                f("note", "string", false));
+        PrecheckResult forwardPre = registry.precheck(asForward, null);
+        log.info("[切换级别-FORWARD删除必填] 预检={}, 分组依据={}",
+                forwardPre.status(), forwardPre.violationsByType());
+        assertEquals(PrecheckStatus.REJECTED, forwardPre.status());
+        assertTrue(forwardPre.violationsByType().containsKey(ChangeType.FIELD_REMOVED.name()));
+        GovernanceException ex = assertThrows(GovernanceException.class, () -> registry.register(asForward));
+        assertEquals(forwardPre.violations(), ex.getReport().violations(),
+                "切换级别后预检与正式注册依据仍须逐条一致");
+        assertEquals(1, registry.versions(forwardName).size(), "FORWARD 下被拒不落库");
+    }
+
+    /**
+     * 断言删除字段候选在预检与正式注册中结论/依据一致：
+     * @param removedRequired true=候选删除了基线中的必填字段（FORWARD/FULL 应拒）；false=删除可选字段（一律放行）
+     */
+    private void assertRemovalParity(CompatibilityLevel level, String name,
+                                     DataContract baseline, DataContract candidate,
+                                     boolean removedRequired) {
+        RegistrationResult baseResult = registry.register(baseline);
+        assertEquals(RegistrationStatus.REGISTERED, baseResult.status());
+        int versionsBefore = registry.versions(name).size();
+
+        PrecheckResult pre = registry.precheck(candidate, null);
+        boolean shouldReject = removedRequired && level != CompatibilityLevel.BACKWARD;
+        log.info("[删除字段一致性] level={}, name={}, 删除必填={}, 预检={}, 依据={}",
+                level, name, removedRequired, pre.status(), pre.violations());
+
+        if (shouldReject) {
+            assertEquals(PrecheckStatus.REJECTED, pre.status(), level + " 删除必填必须预检拒绝");
+            assertNull(pre.resolvedVersion(), "拒绝结论不得携带版本号");
+            assertTrue(pre.violations().stream()
+                            .anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED),
+                    level + " 拒绝依据必须能按变更种类区分为 FIELD_REMOVED");
+            assertEquals(versionsBefore, registry.versions(name).size(), "预检只读，不得改动已注册数据");
+
+            GovernanceException ex = assertThrows(GovernanceException.class,
+                    () -> registry.register(candidate));
+            assertEquals(RejectReason.INCOMPATIBLE_SCHEMA, ex.getReason());
+            assertEquals(pre.violations(), ex.getReport().violations(),
+                    level + " 预检与正式注册的拒绝依据必须逐条一致");
+            assertEquals(versionsBefore, registry.versions(name).size(),
+                    level + " 正式拒绝不得留下半写入状态");
+            // 再预检一次，结论保持稳定
+            assertEquals(pre.violations(), registry.precheck(candidate, null).violations(),
+                    "重复预检结论必须稳定一致");
+        } else {
+            assertEquals(PrecheckStatus.COMPATIBLE, pre.status(),
+                    level + " 删除" + (removedRequired ? "必填" : "可选") + "字段应判定为合法演进");
+            RegistrationResult registered = registry.register(candidate);
+            assertEquals(RegistrationStatus.REGISTERED, registered.status());
+            assertEquals(pre.resolvedVersion(), registered.version(),
+                    level + " 正式注册版本号必须与预检预告一致");
+            assertEquals(versionsBefore + 1, registry.versions(name).size());
+        }
+    }
+
     private static Integer resolvedVersionSafe(PrecheckResult r) {
         return r.resolvedVersion();
     }

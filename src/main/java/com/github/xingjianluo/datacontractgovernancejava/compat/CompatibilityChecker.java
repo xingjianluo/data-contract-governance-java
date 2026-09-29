@@ -22,7 +22,10 @@ import java.util.stream.Collectors;
  * - FULL：双向都必须成立；NONE 不做约束。
  *
  * 规则（NONE 一律放行）：
- * - 删除字段：BACKWARD/FULL 拒绝（新读者读旧数据时字段缺失），FORWARD 允许；
+ * - 删除字段（严格按读方向，并区分被删字段原本的必填性）：
+ *   · BACKWARD 一律允许删除——旧数据携带该字段而新读者不再消费它，读者只会忽略多余字段，不会读丢；
+ *   · FORWARD 删除【必填】字段拒绝（旧读者仍按必填消费，新数据不再提供该字段 -> 读丢）；删除可选字段允许；
+ *   · FULL 删除必填字段拒绝（FORWARD 一侧读丢），删除可选字段允许（双向都能容忍）；
  * - 新增必填字段：BACKWARD/FULL 拒绝（旧数据无该字段），FORWARD 允许；
  * - 新增可选字段：各级别均允许；
  * - 类型变更：BACKWARD/FORWARD/FULL 均拒绝；
@@ -78,17 +81,28 @@ public class CompatibilityChecker {
             }
         }
 
-        // 4) 删除字段（含重命名的旧名）判定
-        // BACKWARD/FULL：新读者必须能读旧数据，删除字段会使旧数据中的该字段在新契约里无处安放 -> 拒绝
-        boolean backwardSafe = level == CompatibilityLevel.BACKWARD || level == CompatibilityLevel.FULL;
-        if (backwardSafe) {
+        // 4) 删除字段（含重命名的旧名）判定——严格跟随级别的读写方向：
+        boolean forwardSafe = level == CompatibilityLevel.FORWARD || level == CompatibilityLevel.FULL;
+        // FORWARD：旧读者必须能读新数据；若删掉的是必填字段，旧契约仍要求该字段存在，
+        //          而新数据已不再提供 -> 旧读者读丢，必须拦住；删掉的若是可选字段，
+        //          旧读者本就要容忍其缺失，合法放行。
+        // BACKWARD：新读者读旧数据；旧数据仍携带被删字段，新读者忽略多余字段即可，
+        //          删除必填/可选都不会读丢，一律放行。
+        // FULL：等价于双向同时成立，因此仅 FORWARD 一侧会读丢的“删除必填”拦住，
+        //       删除可选双向都能容忍，不得误拒。
+        if (forwardSafe) {
             for (String name : removed) {
-                violations.add(new CompatibilityViolation(ChangeType.FIELD_REMOVED, name,
-                        "级别 " + level + " 不允许删除字段（新读者需能读取旧数据）"));
+                ContractField removedField = oldFields.get(name);
+                if (removedField.isRequired()) {
+                    violations.add(new CompatibilityViolation(ChangeType.FIELD_REMOVED, name,
+                            "删除必填字段 '" + name + "'：级别 " + level
+                                    + " 要求旧读者能读取新数据，而新契约不再提供该必填字段，旧读者会读丢"));
+                }
             }
         }
 
         // 5) 新增字段判定：必填新增在 BACKWARD/FULL 下拒绝（旧数据中不存在该字段）
+        boolean backwardSafe = level == CompatibilityLevel.BACKWARD || level == CompatibilityLevel.FULL;
         for (String name : added) {
             ContractField field = newFields.get(name);
             if (field.isRequired() && backwardSafe) {
@@ -99,7 +113,6 @@ public class CompatibilityChecker {
 
         // 6) 共有字段：类型变更与必填性调整
         // FORWARD/FULL：旧读者必须能读新数据
-        boolean forwardSafe = level == CompatibilityLevel.FORWARD || level == CompatibilityLevel.FULL;
         for (String name : oldFields.keySet()) {
             ContractField oldField = oldFields.get(name);
             ContractField newField = newFields.get(name);

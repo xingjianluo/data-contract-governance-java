@@ -17,20 +17,23 @@ api/       REST 入口与统一异常映射（拒绝原因 -> HTTP 409）
 
 判定严格按兼容级别声明的**读方向**执行：
 
-- **BACKWARD（向后兼容）**：新版本契约（新读者）必须能读取**旧版本数据**。旧数据里有的字段不能删、不能缺，旧数据没有的必填字段不能加。
-- **FORWARD（向前兼容）**：旧版本契约（旧读者）必须能读取**新版本数据**。新数据中可能缺失/为空的字段，不能让仍按旧契约消费的读者失败。
-- **FULL**：双向都必须成立，即同时满足 BACKWARD 与 FORWARD。
+- **BACKWARD（向后兼容）**：新版本契约（新读者）必须能读取**旧版本数据**。旧数据里有、而新契约里没有的字段，新读者忽略即可，不会读丢；但旧数据没有的必填字段不能加，旧数据中可能缺失的字段不能收紧为必填。
+- **FORWARD（向前兼容）**：旧版本契约（旧读者）必须能读取**新版本数据**。新数据中可能缺失/为空的字段（包括**被删掉的必填字段**、由必填放宽为可选的字段），不能让仍按旧契约消费的读者失败；旧读者本就容忍缺失的可选字段则可自由删除。
+- **FULL**：双向都必须成立，即同时满足 BACKWARD 与 FORWARD。注意不是把某一个方向的限制直接套到整个级别上——只有真正会让某一侧读方读丢字段的变化才算破坏；例如删除字段时，仅“删除必填字段”会在 FORWARD 一侧（旧读者读新数据）读丢而被拒，删除可选字段双向都能容忍，仍然放行。
 - **NONE**：不做任何兼容性约束。
+
+**删除字段的读写方向（按被删字段原本的必填性区分）**：旧数据由生产方按旧契约写出、新数据按新契约写出，读者忽略多余字段、但无法容忍自己仍要求存在、数据里却没有的字段。
 
 | 变更 | BACKWARD | FORWARD | FULL |
 |---|---|---|---|
-| 删除字段 | 拒绝（新读者读旧数据缺字段） | 允许 | 拒绝 |
+| 删除必填字段 | 允许（新读者读旧数据，旧数据仍带该字段，忽略即可） | **拒绝（旧读者按必填读新数据，字段已不存在 -> 读丢）** | **拒绝（FORWARD 一侧读丢）** |
+| 删除可选字段 | 允许（旧数据仍带该字段，忽略即可） | 允许（旧读者本就容忍可选字段缺失） | 允许（双向都能容忍，不得误拒） |
 | 新增必填字段 | 拒绝（旧数据无此字段） | 允许 | 拒绝 |
 | 新增可选字段 | 允许 | 允许 | 允许 |
 | 类型变更 | 拒绝 | 拒绝 | 拒绝 |
 | 必填收紧（可选→必填） | 拒绝（旧数据可能缺该字段） | 允许 | 拒绝 |
 | 必填放宽（必填→可选） | 允许 | **拒绝（旧读者按必填读新数据，字段可能缺失/为空）** | **拒绝** |
-| 重命名 | 视为删除+新增，按上述规则判定，结论中附 `FIELD_RENAMED` 提示依据 | 同左 | 同左 |
+| 重命名 | 视为删除+新增，按上述规则判定（删除侧按被删字段的必填性），结论中附 `FIELD_RENAMED` 提示依据 | 同左 | 同左 |
 
 判定结论为 `CompatibilityReport(compatible, violations)`，每条违规携带 `ChangeType`（FIELD_ADDED / FIELD_REMOVED / TYPE_CHANGED / REQUIRED_TIGHTENED / REQUIRED_RELAXED / FIELD_RENAMED）、字段名与可读描述，拒绝原因彼此可区分。切换兼容级别后，同一结构变化的结论严格跟随该级别的真实读写方向：该拦的破坏性变更一定拦住，合法演进不误伤。
 
@@ -111,7 +114,7 @@ GET  /api/lineage/sensitivity/{contract}/{field}  查询字段有效敏感级别
 ## 本地验证
 
 ```bash
-mvn test               # 运行全部测试（兼容性、演进预检、历史重放、血缘、并发幂等，共 28 例）
+mvn test               # 运行全部测试（兼容性、删除字段方向矩阵、演进预检一致性、历史重放、血缘、并发幂等，共 32 例）
 mvn spring-boot:run    # 本地启动，默认 8080 端口
 ```
 
@@ -124,11 +127,19 @@ curl -s -XPOST localhost:8080/api/contracts -H 'Content-Type: application/json' 
 # 预检一个破坏性候选（新增必填），观察 REJECTED 且 GET versions 仍是 1 个版本
 curl -s -XPOST localhost:8080/api/contracts/precheck -H 'Content-Type: application/json' -d \
   '{"name":"orders","compatibility":"BACKWARD","fields":[{"name":"id","type":"long","required":true},{"name":"code","type":"string","required":true}]}'
+
+# FORWARD 级别注册 v1 后，预检“删除必填字段 id”的候选：应 REJECTED（FIELD_REMOVED），
+# 且正式注册同样被拒、版本数不增加；把被删字段换成可选字段，或级别换成 BACKWARD，则应放行
+curl -s -XPOST localhost:8080/api/contracts -H 'Content-Type: application/json' -d \
+  '{"name":"events","compatibility":"FORWARD","fields":[{"name":"id","type":"long","required":true},{"name":"note","type":"string","required":false}]}'
+curl -s -XPOST localhost:8080/api/contracts/precheck -H 'Content-Type: application/json' -d \
+  '{"name":"events","compatibility":"FORWARD","fields":[{"name":"note","type":"string","required":false}]}'
 ```
 
 测试覆盖：
 
-- 兼容性方向语义：删字段/类型变更/必填收紧与放宽在 BACKWARD/FORWARD/FULL 各级别下的判定；
+- 兼容性方向语义：删除必填字段/删除可选字段在 BACKWARD/FORWARD/FULL 各级别下的判定矩阵，以及类型变更/必填收紧与放宽的方向判定；
+- **删除字段候选在预检与正式注册中结论与拒绝依据逐条一致**（依据按变更种类标 `FIELD_REMOVED`），被拒候选在两个入口都不落库、不留半写入状态；同一份候选切换兼容级别后结论跟随该级别真实读写含义；
 - **演进预检与正式注册结论逐条一致**（含拒绝依据按变更种类分组）、预检只读不落库、显式参照版本；
 - **历史版本重放收敛**：补投旧版本返回原版本号且不新增，全新内容才升版并仍过兼容判定；
 - 12 线程并发重放 v1/v2 只收敛到已有版本；16 线程并发注册版本号唯一连续；
