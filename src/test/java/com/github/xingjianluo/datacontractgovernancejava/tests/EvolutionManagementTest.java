@@ -211,6 +211,58 @@ class EvolutionManagementTest {
         assertEquals(2, registry.versions("evt").size(), "并发重放不得产生重复版本");
     }
 
+    @Test
+    void fieldRemovalPrecheckParityAcrossLevels() {
+        // 每个级别 × 必填性组合用独立契约线，互不影响；v1 = {id 必填, note 可选}
+        assertRemovalAccepted("rm-bw-req", CompatibilityLevel.BACKWARD, true);
+        assertRemovalAccepted("rm-bw-opt", CompatibilityLevel.BACKWARD, false);
+        assertRemovalRejected("rm-fw-req", CompatibilityLevel.FORWARD, true);
+        assertRemovalAccepted("rm-fw-opt", CompatibilityLevel.FORWARD, false);
+        assertRemovalRejected("rm-full-req", CompatibilityLevel.FULL, true);
+        assertRemovalAccepted("rm-full-opt", CompatibilityLevel.FULL, false);
+    }
+
+    private DataContract removalCandidate(String name, CompatibilityLevel level, boolean removeRequired) {
+        return removeRequired
+                ? contract(name, level, f("note", "string", false))
+                : contract(name, level, f("id", "long", true));
+    }
+
+    private void assertRemovalAccepted(String name, CompatibilityLevel level, boolean removeRequired) {
+        registry.register(contract(name, level, f("id", "long", true), f("note", "string", false)));
+        DataContract candidate = removalCandidate(name, level, removeRequired);
+        int before = registry.versions(name).size();
+        PrecheckResult pre = registry.precheck(candidate, null);
+        log.info("[删除一致性-放行] name={}, level={}, 删必填={}, 预检={}, 依据={}",
+                name, level, removeRequired, pre.status(), pre.violationsByType());
+        assertEquals(PrecheckStatus.COMPATIBLE, pre.status(),
+                level + " 下" + (removeRequired ? "删必填" : "删可选") + "预检应通过");
+        RegistrationResult registered = registry.register(candidate);
+        assertEquals(RegistrationStatus.REGISTERED, registered.status());
+        assertEquals(pre.resolvedVersion(), registered.version(), "正式注册版本号必须与预检预告一致");
+        assertEquals(before + 1, registry.versions(name).size());
+    }
+
+    private void assertRemovalRejected(String name, CompatibilityLevel level, boolean removeRequired) {
+        registry.register(contract(name, level, f("id", "long", true), f("note", "string", false)));
+        DataContract candidate = removalCandidate(name, level, removeRequired);
+        int before = registry.versions(name).size();
+        PrecheckResult pre = registry.precheck(candidate, null);
+        log.info("[删除一致性-拒绝] name={}, level={}, 删必填={}, 预检={}, 分组依据={}",
+                name, level, removeRequired, pre.status(), pre.violationsByType());
+        assertEquals(PrecheckStatus.REJECTED, pre.status());
+        assertTrue(pre.violationsByType().containsKey(ChangeType.FIELD_REMOVED.name()),
+                "删除必填字段的拒绝依据必须能按变更种类 FIELD_REMOVED 区分");
+        assertEquals(before, registry.versions(name).size(), "被拒绝的预检不得改动任何已注册数据");
+
+        GovernanceException ex = assertThrows(GovernanceException.class,
+                () -> registry.register(candidate));
+        assertEquals(RejectReason.INCOMPATIBLE_SCHEMA, ex.getReason());
+        assertEquals(pre.violations(), ex.getReport().violations(),
+                "删除场景下预检与正式注册的拒绝依据必须完全一致");
+        assertEquals(before, registry.versions(name).size(), "被拒绝的正式注册不得留下半写入状态");
+    }
+
     private static Integer resolvedVersionSafe(PrecheckResult r) {
         return r.resolvedVersion();
     }

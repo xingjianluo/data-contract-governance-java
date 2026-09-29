@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -41,25 +42,77 @@ class CompatibilityCheckerTest {
     }
 
     @Test
+    void fieldRemovalMatrixAcrossLevelsAndRequiredness() {
+        // 矩阵：级别（行）× 被删字段必填性（列）
+        //                         删必填  删可选
+        // BACKWARD（新读旧）        放行    放行
+        // FORWARD（旧读新）        拒绝    放行
+        // FULL（双向）             拒绝    放行
+        record Row(CompatibilityLevel level, boolean removeRequired, boolean expectCompatible) {
+        }
+        List<Row> rows = List.of(
+                new Row(CompatibilityLevel.BACKWARD, true, true),
+                new Row(CompatibilityLevel.BACKWARD, false, true),
+                new Row(CompatibilityLevel.FORWARD, true, false),
+                new Row(CompatibilityLevel.FORWARD, false, true),
+                new Row(CompatibilityLevel.FULL, true, false),
+                new Row(CompatibilityLevel.FULL, false, true)
+        );
+        for (Row row : rows) {
+            DataContract prev = contract(row.level,
+                    f("id", "long", true), f("note", "string", false));
+            DataContract next = row.removeRequired
+                    ? contract(row.level, f("note", "string", false))
+                    : contract(row.level, f("id", "long", true));
+            String caseName = row.level + (row.removeRequired ? "删除必填" : "删除可选");
+            CompatibilityReport report = checkAndLog(caseName, prev, next);
+            assertEquals(row.expectCompatible, report.compatible(),
+                    caseName + " 期望 compatible=" + row.expectCompatible);
+            if (!row.expectCompatible) {
+                assertTrue(report.violations().stream()
+                        .anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
+            }
+        }
+    }
+
+    @Test
     void firstVersionIsAlwaysCompatible() {
         DataContract v1 = contract(CompatibilityLevel.FULL, f("id", "long", true));
         assertTrue(checker.check(null, v1).compatible());
     }
 
     @Test
-    void backwardRejectsFieldRemoval() {
-        DataContract v1 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true), f("note", "string", false));
-        DataContract v2 = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
-        CompatibilityReport report = checkAndLog("BACKWARD删除字段", v1, v2);
-        assertFalse(report.compatible());
-        assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
+    void backwardAllowsRemovalOfRequiredAndOptionalFields() {
+        // BACKWARD：新读者读旧数据，旧数据中多出的字段可直接忽略，删除必填/可选均合法
+        DataContract v1 = contract(CompatibilityLevel.BACKWARD,
+                f("id", "long", true), f("note", "string", false));
+
+        DataContract removeOptional = contract(CompatibilityLevel.BACKWARD, f("id", "long", true));
+        assertTrue(checkAndLog("BACKWARD删除可选字段", v1, removeOptional).compatible(),
+                "BACKWARD 下删除可选字段必须放行，不得误伤");
+
+        DataContract removeRequired = contract(CompatibilityLevel.BACKWARD, f("note", "string", false));
+        assertTrue(checkAndLog("BACKWARD删除必填字段", v1, removeRequired).compatible(),
+                "BACKWARD 下删除必填字段同样必须放行（新读者读的是旧数据，多出的 id 被忽略）");
     }
 
     @Test
-    void forwardAllowsFieldRemoval() {
-        DataContract v1 = contract(CompatibilityLevel.FORWARD, f("id", "long", true), f("note", "string", false));
-        DataContract v2 = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
-        assertTrue(checkAndLog("FORWARD删除字段", v1, v2).compatible());
+    void forwardRejectsRequiredRemovalButAllowsOptionalRemoval() {
+        // FORWARD：旧读者读新数据。旧契约里必填的字段在新数据中缺失 -> 破坏读取，必须拦住
+        DataContract v1 = contract(CompatibilityLevel.FORWARD,
+                f("id", "long", true), f("note", "string", false));
+
+        DataContract removeRequired = contract(CompatibilityLevel.FORWARD, f("note", "string", false));
+        CompatibilityReport requiredReport = checkAndLog("FORWARD删除必填字段", v1, removeRequired);
+        assertFalse(requiredReport.compatible(), "FORWARD 下删除必填字段必须拦住");
+        assertTrue(requiredReport.violations().stream()
+                .anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED
+                        && v.field().equals("id")));
+
+        // 删除可选字段：旧读者本就能容忍可选字段缺失，必须放行
+        DataContract removeOptional = contract(CompatibilityLevel.FORWARD, f("id", "long", true));
+        assertTrue(checkAndLog("FORWARD删除可选字段", v1, removeOptional).compatible(),
+                "FORWARD 下删除可选字段必须放行，不得误伤");
     }
 
     @Test
@@ -159,12 +212,32 @@ class CompatibilityCheckerTest {
     }
 
     @Test
-    void fullLevelRejectsBothRemovalAndRequiredAddition() {
+    void fullLevelRemovalFollowsTwoWayReadSemantics() {
+        // FULL 双向成立：删除可选字段两侧读方都能容忍，必须放行（不得把单向限制套到整个级别）
+        DataContract v1 = contract(CompatibilityLevel.FULL,
+                f("id", "long", true), f("note", "string", false));
+        DataContract removeOptional = contract(CompatibilityLevel.FULL, f("id", "long", true));
+        assertTrue(checkAndLog("FULL删除可选字段", v1, removeOptional).compatible(),
+                "FULL 下删除可选字段双向都能容忍，不应被拒");
+
+        // 删除必填字段：FORWARD 方向（旧读者读新数据）读丢必填字段，必须拦住
+        DataContract removeRequired = contract(CompatibilityLevel.FULL, f("note", "string", false));
+        CompatibilityReport removeRequiredReport = checkAndLog("FULL删除必填字段", v1, removeRequired);
+        assertFalse(removeRequiredReport.compatible(), "FULL 下删除必填字段必须拦住");
+        assertTrue(removeRequiredReport.violations().stream()
+                .anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED && v.field().equals("id")));
+    }
+
+    @Test
+    void fullLevelRejectsRequiredAdditionButAllowsOptionalRemovalCombined() {
+        // 删除可选 note（双向可容忍）+ 新增必填 code（BACKWARD 方向旧数据没有该字段）
+        // 仅新增必填构成破坏，删除可选不应产生依据
         DataContract v1 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("note", "string", false));
         DataContract v2 = contract(CompatibilityLevel.FULL, f("id", "long", true), f("code", "string", true));
-        CompatibilityReport report = checkAndLog("FULL删除+新增必填", v1, v2);
+        CompatibilityReport report = checkAndLog("FULL删除可选+新增必填", v1, v2);
         assertFalse(report.compatible());
-        assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED));
         assertTrue(report.violations().stream().anyMatch(v -> v.changeType() == ChangeType.FIELD_ADDED));
+        assertTrue(report.violations().stream().noneMatch(v -> v.changeType() == ChangeType.FIELD_REMOVED),
+                "删除可选字段双向可容忍，不得出现在拒绝依据中");
     }
 }

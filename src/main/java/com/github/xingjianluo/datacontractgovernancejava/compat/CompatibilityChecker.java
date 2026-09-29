@@ -22,7 +22,11 @@ import java.util.stream.Collectors;
  * - FULL：双向都必须成立；NONE 不做约束。
  *
  * 规则（NONE 一律放行）：
- * - 删除字段：BACKWARD/FULL 拒绝（新读者读旧数据时字段缺失），FORWARD 允许；
+ * - 删除字段：删除意味着新数据相对旧数据缺少该字段。
+ *   BACKWARD（新读者读旧数据）：旧数据多出的字段可直接忽略，删必填/删可选均允许；
+ *   FORWARD（旧读者读新数据）：旧读者按旧契约消费，旧契约中必填的字段在新数据里缺失会破坏读取 ->
+ *   删必填拒绝、删可选允许（旧读者本就能容忍可选字段缺失）；
+ *   FULL：双向都要成立，仅删必填拒绝，删可选双向都能容忍，允许。
  * - 新增必填字段：BACKWARD/FULL 拒绝（旧数据无该字段），FORWARD 允许；
  * - 新增可选字段：各级别均允许；
  * - 类型变更：BACKWARD/FORWARD/FULL 均拒绝；
@@ -79,16 +83,22 @@ public class CompatibilityChecker {
         }
 
         // 4) 删除字段（含重命名的旧名）判定
-        // BACKWARD/FULL：新读者必须能读旧数据，删除字段会使旧数据中的该字段在新契约里无处安放 -> 拒绝
-        boolean backwardSafe = level == CompatibilityLevel.BACKWARD || level == CompatibilityLevel.FULL;
-        if (backwardSafe) {
-            for (String name : removed) {
+        // 删除字段影响的是"读新数据"的一侧：新数据里不再有该字段。
+        // BACKWARD 由新读者读旧数据，旧数据多出的字段可忽略 -> 任意删除都允许；
+        // FORWARD 由旧读者读新数据，旧契约中必填的字段缺失会破坏读取 -> 仅删必填拒绝，删可选允许；
+        // FULL 双向成立，删必填（FORWARD 方向破坏）拒绝，删可选允许。
+        boolean forwardSafe = level == CompatibilityLevel.FORWARD || level == CompatibilityLevel.FULL;
+        for (String name : removed) {
+            ContractField oldField = oldFields.get(name);
+            if (oldField.isRequired() && forwardSafe) {
                 violations.add(new CompatibilityViolation(ChangeType.FIELD_REMOVED, name,
-                        "级别 " + level + " 不允许删除字段（新读者需能读取旧数据）"));
+                        "必填字段 '" + name + "' 被删除：级别 " + level
+                                + " 要求旧读者能读新数据，旧读者按必填消费而新数据缺失该字段"));
             }
         }
 
         // 5) 新增字段判定：必填新增在 BACKWARD/FULL 下拒绝（旧数据中不存在该字段）
+        boolean backwardSafe = level == CompatibilityLevel.BACKWARD || level == CompatibilityLevel.FULL;
         for (String name : added) {
             ContractField field = newFields.get(name);
             if (field.isRequired() && backwardSafe) {
@@ -98,8 +108,6 @@ public class CompatibilityChecker {
         }
 
         // 6) 共有字段：类型变更与必填性调整
-        // FORWARD/FULL：旧读者必须能读新数据
-        boolean forwardSafe = level == CompatibilityLevel.FORWARD || level == CompatibilityLevel.FULL;
         for (String name : oldFields.keySet()) {
             ContractField oldField = oldFields.get(name);
             ContractField newField = newFields.get(name);
